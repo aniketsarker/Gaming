@@ -9,12 +9,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.media.AudioManager
 import android.media.audiofx.Equalizer
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
@@ -26,32 +28,43 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.SeekBar
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import kotlin.math.abs
 import kotlin.math.max
 
 class OverlayService : Service() {
+    companion object {
+        @Volatile var running = false
+        @Volatile var dismissed = false
+    }
+
     private lateinit var wm: WindowManager
     private lateinit var nm: NotificationManager
     private lateinit var bubbleLp: WindowManager.LayoutParams
     private var bubble: TextView? = null
+    private var bubbleBg: GradientDrawable? = null
     private var panel: LinearLayout? = null
     private var stats: TextView? = null
     private var eq: Equalizer? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var gamePkg: String? = null
     private var colorOn = false
+    private var soundMode = 0
+    private var colorIdx = 0
+    private var forceHz = true
+    private var hot = false
+    private var prevSaver = 0
     private var prevFilter = NotificationManager.INTERRUPTION_FILTER_ALL
     private val handler = Handler(Looper.getMainLooper())
+    private val prefs by lazy { getSharedPreferences("gm", Context.MODE_PRIVATE) }
 
     private val tick = object : Runnable {
         override fun run() {
             updateStats()
-            handler.postDelayed(this, 2000)
+            handler.postDelayed(this, 3000)
         }
     }
 
@@ -59,14 +72,20 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        running = true
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         nm = getSystemService(NotificationManager::class.java)
         startFg()
+        prefs.edit().putBoolean("lock", false).apply()
         prevFilter = nm.currentInterruptionFilter
         if (nm.isNotificationPolicyAccessGranted) {
             nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALARMS)
         }
         addBubble()
+        setForceHz(true)
+        batterySaverOff()
+        wifiOn()
+        handler.post(tick)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,12 +95,17 @@ class OverlayService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         handler.removeCallbacks(tick)
+        prefs.edit().putBoolean("lock", false).apply()
         closePanel()
         bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         bubble = null
         try { eq?.release() } catch (_: Exception) {}
         if (colorOn) setColor(-1)
+        setForceHz(false)
+        restoreSaver()
+        try { wifiLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
         if (nm.isNotificationPolicyAccessGranted) nm.setInterruptionFilter(prevFilter)
         super.onDestroy()
     }
@@ -105,9 +129,13 @@ class OverlayService : Service() {
         }
     }
 
-    // ---------- 120Hz ----------
+    // ---------- Display / 120Hz ----------
     private fun display(): Display =
         getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
+
+    private fun hzMax(): Float = try {
+        display().supportedModes.maxOf { it.refreshRate }
+    } catch (_: Exception) { 120f }
 
     private fun applyHz(lp: WindowManager.LayoutParams) {
         try {
@@ -123,7 +151,52 @@ class OverlayService : Service() {
         } catch (_: Exception) {}
     }
 
-    // ---------- Color (enemy visibility) ----------
+    /** on = display-র minimum refresh rate সর্বোচ্চ করো, off = আগের মান ফেরাও */
+    private fun setForceHz(on: Boolean) {
+        if (!Settings.System.canWrite(this)) return
+        try {
+            if (on) {
+                if (!prefs.contains("prev_min")) {
+                    prefs.edit().putFloat(
+                        "prev_min",
+                        Settings.System.getFloat(contentResolver, "min_refresh_rate", 0f)
+                    ).apply()
+                }
+                Settings.System.putFloat(contentResolver, "min_refresh_rate", hzMax())
+            } else if (prefs.contains("prev_min")) {
+                Settings.System.putFloat(contentResolver, "min_refresh_rate", prefs.getFloat("prev_min", 0f))
+                prefs.edit().remove("prev_min").apply()
+            }
+        } catch (_: Exception) {}
+    }
+
+    // ---------- Battery Saver ----------
+    private fun batterySaverOff() {
+        try {
+            prevSaver = Settings.Global.getInt(contentResolver, "low_power", 0)
+            if (prevSaver == 1) Settings.Global.putInt(contentResolver, "low_power", 0)
+        } catch (_: Exception) {}
+    }
+
+    private fun restoreSaver() {
+        try {
+            if (prevSaver == 1) Settings.Global.putInt(contentResolver, "low_power", 1)
+        } catch (_: Exception) {}
+    }
+
+    // ---------- Wi-Fi Low Latency ----------
+    private fun wifiOn() {
+        if (Build.VERSION.SDK_INT < 29) return
+        try {
+            val w = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = w.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "gm").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {}
+    }
+
+    // ---------- Color ----------
     // mode: -1 = off, 12 = A, 11 = B, 13 = C
     private fun setColor(mode: Int) {
         try {
@@ -142,25 +215,32 @@ class OverlayService : Service() {
     }
 
     // ---------- Floating bubble ----------
+    private fun paintBubble() {
+        bubbleBg?.setColor(if (hot) 0xCCD32F2F.toInt() else 0x99263238.toInt())
+    }
+
     private fun addBubble() {
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0x99263238.toInt())
+            setStroke(dp(1), 0x55FFFFFF)
+        }
+        bubbleBg = bg
         val b = TextView(this).apply {
             text = "🎮"
-            textSize = 22f
+            textSize = 15f
             gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0xCC1E88E5.toInt())
-            }
+            background = bg
         }
         bubbleLp = WindowManager.LayoutParams(
-            dp(48), dp(48),
+            dp(36), dp(36),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = 0
-            y = dp(200)
+            y = dp(160)
         }
         applyHz(bubbleLp)
         b.setOnTouchListener(object : View.OnTouchListener {
@@ -192,22 +272,17 @@ class OverlayService : Service() {
     private fun togglePanel() { if (panel == null) openPanel() else closePanel() }
 
     private fun closePanel() {
-        handler.removeCallbacks(tick)
         panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         panel = null
         stats = null
     }
 
-    private fun label(t: String) = TextView(this).apply {
-        text = t
-        setTextColor(Color.WHITE)
-        textSize = 13f
-        setPadding(0, dp(8), 0, dp(2))
-    }
-
     private fun seek(maxV: Int, cur: Int, onChange: (Int) -> Unit) = SeekBar(this).apply {
         this.max = maxV
         progress = cur
+        val c = ColorStateList.valueOf(0xFF2979FF.toInt())
+        progressTintList = c
+        thumbTintList = c
         setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                 if (fromUser) onChange(p)
@@ -217,49 +292,149 @@ class OverlayService : Service() {
         })
     }
 
-    private fun btnRow(items: List<Pair<String, Int>>, onClick: (Int) -> Unit): LinearLayout {
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        items.forEach { (name, v) ->
-            row.addView(Button(this).apply {
-                text = name
-                textSize = 11f
-                setOnClickListener { onClick(v) }
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+    private fun sliderRow(icon: String, maxV: Int, cur: Int, onChange: (Int) -> Unit): LinearLayout {
+        val r = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
-        return row
+        r.addView(
+            TextView(this).apply { text = icon; textSize = 13f; setTextColor(Color.WHITE) },
+            LinearLayout.LayoutParams(dp(24), LinearLayout.LayoutParams.WRAP_CONTENT)
+        )
+        r.addView(seek(maxV, cur, onChange), LinearLayout.LayoutParams(0, dp(30), 1f))
+        return r
+    }
+
+    private fun chip(icon: String, onClick: (TextView) -> Unit): TextView {
+        val t = TextView(this).apply {
+            text = icon
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(0x22FFFFFF)
+            }
+        }
+        t.setOnClickListener { onClick(t) }
+        return t
+    }
+
+    private fun setOn(t: TextView, on: Boolean, color: Int = 0xFF2979FF.toInt()) {
+        (t.background as GradientDrawable).setColor(if (on) color else 0x22FFFFFF)
     }
 
     private fun openPanel() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             background = GradientDrawable().apply {
-                setColor(0xEE121212.toInt())
-                cornerRadius = dp(16).toFloat()
+                setColor(0xE6161B22.toInt())
+                cornerRadius = dp(20).toFloat()
+                setStroke(dp(1), 0x33FFFFFF)
             }
         }
-        stats = label("...").also { root.addView(it) }
 
-        // Focus (DND)
-        root.addView(Switch(this).apply {
-            text = "Focus (শুধু alarm আসবে)"
-            setTextColor(Color.WHITE)
-            isChecked = nm.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL
-            setOnCheckedChangeListener { _, on ->
-                if (!nm.isNotificationPolicyAccessGranted) {
-                    toast("অ্যাপে গিয়ে DND permission দাও"); isChecked = !on; return@setOnCheckedChangeListener
-                }
+        // এক লাইনের ছোট stats
+        val st = TextView(this).apply {
+            setTextColor(0xCCFFFFFF.toInt())
+            textSize = 11f
+            gravity = Gravity.CENTER
+        }
+        stats = st
+        root.addView(st, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        updateStats()
+
+        // আইকন বাটনের সারি
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, dp(6))
+        }
+        fun add(v: View) {
+            row.addView(v, LinearLayout.LayoutParams(0, dp(36), 1f).apply {
+                setMargins(dp(2), 0, dp(2), 0)
+            })
+        }
+
+        // 🔒 Lock (Back/Home আটকানো)
+        val lockOn = prefs.getBoolean("lock", false)
+        val lk = chip(if (lockOn) "🔒" else "🔓") { t ->
+            val on = !prefs.getBoolean("lock", false)
+            prefs.edit().putBoolean("lock", on).apply()
+            t.text = if (on) "🔒" else "🔓"
+            setOn(t, on, 0xFFFF9100.toInt())
+            toast(if (on) "Lock চালু: game থেকে বের হওয়া যাবে না" else "Lock বন্ধ")
+        }
+        setOn(lk, lockOn, 0xFFFF9100.toInt())
+        add(lk)
+
+        // 🔕 Focus
+        val fc = chip("🔕") { t ->
+            if (!nm.isNotificationPolicyAccessGranted) {
+                toast("অ্যাপে গিয়ে DND permission দাও")
+            } else {
+                val wasOff = nm.currentInterruptionFilter == NotificationManager.INTERRUPTION_FILTER_ALL
                 nm.setInterruptionFilter(
-                    if (on) NotificationManager.INTERRUPTION_FILTER_ALARMS else NotificationManager.INTERRUPTION_FILTER_ALL
+                    if (wasOff) NotificationManager.INTERRUPTION_FILTER_ALARMS
+                    else NotificationManager.INTERRUPTION_FILTER_ALL
                 )
+                setOn(t, wasOff)
             }
+        }
+        setOn(fc, nm.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL)
+        add(fc)
+
+        // 🎧 Sound (Normal → Bass → Footstep)
+        val sc = chip("🎧") { t ->
+            soundMode = (soundMode + 1) % 3
+            applyEq(soundMode)
+            setOn(t, soundMode != 0)
+            toast(listOf("Sound: Normal", "Sound: Bass", "Sound: Footstep")[soundMode])
+        }
+        setOn(sc, soundMode != 0)
+        add(sc)
+
+        // 🎨 Enemy রং (Off → A → B → C)
+        val cc = chip("🎨") { t ->
+            colorIdx = (colorIdx + 1) % 4
+            setColor(intArrayOf(-1, 12, 11, 13)[colorIdx])
+            setOn(t, colorIdx != 0)
+            toast(if (colorIdx == 0) "রং: Off" else "রং: " + "ABC"[colorIdx - 1])
+        }
+        setOn(cc, colorIdx != 0)
+        add(cc)
+
+        // 🖥 120Hz ধরে রাখা
+        val hc = chip("🖥") { t ->
+            forceHz = !forceHz
+            setForceHz(forceHz)
+            setOn(t, forceHz)
+            toast(if (forceHz) "120Hz ধরে রাখা চালু" else "120Hz ধরে রাখা বন্ধ")
+        }
+        setOn(hc, forceHz)
+        add(hc)
+
+        // 🧹 RAM পরিষ্কার
+        add(chip("🧹") {
+            val n = GameUtil.cleanRam(this@OverlayService, gamePkg)
+            toast("$n টা app বন্ধ হলো")
+            updateStats()
         })
 
-        // Brightness
-        root.addView(label("☀ Brightness"))
-        val curB = try { Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS) } catch (_: Exception) { 128 }
-        root.addView(seek(255, curB) { p ->
+        // ✖ Game Mode বন্ধ
+        add(chip("✖") {
+            dismissed = true
+            stopSelf()
+        })
+        root.addView(row)
+
+        // ☀ Brightness
+        val curB = try {
+            Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+        } catch (_: Exception) { 128 }
+        root.addView(sliderRow("☀", 255, curB) { p ->
             if (Settings.System.canWrite(this)) {
                 Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE,
                     Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
@@ -267,45 +442,27 @@ class OverlayService : Service() {
             } else toast("অ্যাপে গিয়ে Brightness permission দাও")
         })
 
-        // Volume
-        root.addView(label("🔊 Volume"))
-        root.addView(seek(am.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
+        // 🔊 Volume
+        root.addView(sliderRow("🔊", am.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
             am.getStreamVolume(AudioManager.STREAM_MUSIC)) { p ->
             am.setStreamVolume(AudioManager.STREAM_MUSIC, p, 0)
         })
 
-        // Sound preset
-        root.addView(label("🎧 Sound"))
-        root.addView(btnRow(listOf("Normal" to 0, "Bass" to 1, "Footstep" to 2)) { applyEq(it) })
-
-        // Color (enemy visibility)
-        root.addView(label("🎨 Enemy রং (একটা একটা করে try করো)"))
-        root.addView(btnRow(listOf("Off" to -1, "A" to 12, "B" to 11, "C" to 13)) { setColor(it) })
-
-        // Actions
-        root.addView(Button(this).apply {
-            text = "🧹 RAM পরিষ্কার"
-            setOnClickListener {
-                val n = GameUtil.cleanRam(this@OverlayService, gamePkg)
-                toast("$n টা app বন্ধ করা হলো")
-                updateStats()
-            }
-        })
-        root.addView(Button(this).apply {
-            text = "✖ Game Mode বন্ধ"
-            setOnClickListener { stopSelf() }
-        })
-
+        val dm = resources.displayMetrics
+        val w = dp(272)
         val lp = WindowManager.LayoutParams(
-            dp(290), WindowManager.LayoutParams.WRAP_CONTENT,
+            w, WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.CENTER }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (bubbleLp.x + dp(44)).coerceAtMost(dm.widthPixels - w).coerceAtLeast(0)
+            y = bubbleLp.y.coerceAtMost(dm.heightPixels - dp(180)).coerceAtLeast(0)
+        }
         applyHz(lp)
         wm.addView(root, lp)
         panel = root
-        handler.post(tick)
     }
 
     private fun updateStats() {
@@ -313,12 +470,22 @@ class OverlayService : Service() {
         val lvl = b?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0
         val scale = b?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
         val temp = (b?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10f
+
+        // 🌡 গরম হলে বল লাল হবে, একবার সতর্কও করবে
+        val nowHot = temp >= 42f
+        if (nowHot != hot) {
+            hot = nowHot
+            paintBubble()
+            if (hot) toast("🌡 ফোন গরম হচ্ছে: $temp°")
+        }
+
         val mi = ActivityManager.MemoryInfo()
         (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
         val hz = try { display().refreshRate.toInt() } catch (_: Exception) { 0 }
-        stats?.text = "🔋 ${lvl * 100 / scale}%   🌡 $temp°C\n" +
-            "🧠 খালি RAM: ${mi.availMem / 1048576} MB\n" +
-            "🖥 Display: $hz Hz"
+        stats?.let {
+            it.text = "🔋${lvl * 100 / scale}%   🌡$temp°   🧠${mi.availMem / 1048576}MB   🖥${hz}Hz"
+            it.setTextColor(if (hot) 0xFFFF5252.toInt() else 0xCCFFFFFF.toInt())
+        }
     }
 
     private fun applyEq(mode: Int) {
